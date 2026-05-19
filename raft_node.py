@@ -1,528 +1,558 @@
 """
-raft_node.py: Implementação do algoritmo de consenso Raft usando PyRO5.
-
-Doc: Raft (https://raft.github.io/raft.pdf)
-
-Uso:
-    python raft_node.py <node_id>   (node_id: 1, 2, 3 ou 4)
-
-Cada nó cria um Daemon PyRO na porta fixada em NODE_CONFIG e se registra
-no servidor de nomes do PyRO. As URIs resultantes ficam hard-coded:
-    PYRO:raft.node1@localhost:9091
-    PYRO:raft.node2@localhost:9092
-    PYRO:raft.node3@localhost:9093
-    PYRO:raft.node4@localhost:9094
+raft_node.py — Implementação do algoritmo Raft com PyRO5.
 """
 
 import sys
-# import time
 import random
 import logging
 import threading
 
 import Pyro5.api
 import Pyro5.server
-# import Pyro5.errors
+
 
 # ---------------------------------------------------------------------------
 # Configuração dos nós
 # ---------------------------------------------------------------------------
 
-# Mapeamento node_id -> {objectId, porta}
-NODE_CONFIG = {
-    1: {"object_id": "raft.node1", "port": 9091},
-    2: {"object_id": "raft.node2", "port": 9092},
-    3: {"object_id": "raft.node3", "port": 9093},
-    4: {"object_id": "raft.node4", "port": 9094},
+NOS = {
+    1: {"object_id": "raft.node1", "porta": 9091},
+    2: {"object_id": "raft.node2", "porta": 9092},
+    3: {"object_id": "raft.node3", "porta": 9093},
+    4: {"object_id": "raft.node4", "porta": 9094},
 }
 
-# URIs resultantes (PYRO:objectId@localhost:porta): usadas para contato direto
-NODE_URIS = {
-    nid: f"PYRO:{cfg['object_id']}@localhost:{cfg['port']}"
-    for nid, cfg in NODE_CONFIG.items()
-}
+# Uniform Resource Identifier
+URIS = {}
+for node_id in NOS:
+    cfg = NOS[node_id]
 
-# Nome registrado no servidor de nomes para identificar o líder atual
-LEADER_NS_NAME = "raft.leader"
+    objeto_id = cfg["object_id"]
+    num_porta = cfg["porta"]
+
+    porta_string      = str(num_porta)
+    endereco_completo = "PYRO:" + objeto_id + "@localhost:" + porta_string
+
+    URIS[node_id] = endereco_completo 
+
+# Nome do líder no servidor de nomes
+NOME_LIDER = "raft.leader"
+
+# Intervalo entre heartbeats do líder (segundos)
+INTERVALO_HEARTBEAT = 0.5
+
+# Faixa do timeout de eleição — aleatório para evitar candidatos simultâneos
+TIMEOUT_ELEICAO_MIN = 1.5
+TIMEOUT_ELEICAO_MAX = 3.0
+
+# Estados possíveis de um nó
+SEGUIDOR  = "SEGUIDOR"
+CANDIDATO = "CANDIDATO"
+LIDER     = "LIDER"
+
 
 # ---------------------------------------------------------------------------
-# Parâmetros de tempo
+# Nó Raft
 # ---------------------------------------------------------------------------
 
-# Intervalo entre heartbeats enviados pelo líder (segundos)
-HEARTBEAT_INTERVAL = 0.5
+@Pyro5.api.expose
+class NoRaft:
 
-# Faixa do timeout de eleição (aleatório para evitar candidatos simultâneos)
-ELECTION_TIMEOUT_MIN = 1.5
-ELECTION_TIMEOUT_MAX = 3.0
-
-# ---------------------------------------------------------------------------
-# Estados possíveis de um nó Raft
-# ---------------------------------------------------------------------------
-FOLLOWER  = "FOLLOWER"
-CANDIDATE = "CANDIDATE"
-LEADER    = "LEADER"
-
-
-# ---------------------------------------------------------------------------
-# Classe principal do nó Raft
-# ---------------------------------------------------------------------------
-
-@Pyro5.api.expose          # expõe todos os métodos públicos via PyRO
-class RaftNode:
-    """
-    Representa um nó participante do cluster Raft.
-    """
-
-    def __init__(self, node_id: int):
+    def __init__(self, node_id):
         self.node_id = node_id
         self.lock    = threading.Lock()
 
-        # --- Estado persistente ---
-        self.current_term = 0     # sempre crescente
-        self.voted_for    = None  # a quem votam no termo atual
-        self.log          = []    # entradas: [{"term": int, "command": str}, ...]
+        # Estado do nó
+        self.estado      = SEGUIDOR
+        self.termo_atual = 0
+        self.votou_em    = None
 
-        # --- Estado volátil ---
-        self.state        = FOLLOWER  # todo nó começa como seguidor
-        self.commit_index = -1        # maior índice de entrada efetivada
-        self.last_applied = -1        # maior índice aplicado à máquina de estados
+        # Log de entradas: [{"termo": int, "comando": str}, ...]
+        self.log = []
 
-        # --- Estado volátil do líder (reiniciado a cada eleição ganha) ---
-        self.next_index  = {}   # next_index[peer]:  próxima entrada a enviar para aquele seguidor
-        self.match_index = {}   # match_index[peer]: maior entrada confirmada naquele seguidor
+        # Índice da última entrada confirmada pela maioria
+        self.commit_index = -1
 
-        # --- Timers ---
-        self._election_timer  = None
-        self._heartbeat_timer = None
-        self._reset_election_timeout()
-        self._start_election_timer()   # começa contando o timeout
+        # Relacionado a "máquina de estados" no paper. Atualmente, sem uso.
+        self.last_applied = -1
 
-        logging.info(f"[Nó {self.node_id}] Iniciado como FOLLOWER | termo=0")
+        # Progresso de replicação por seguidor (só usado quando líder)
+        self.next_index  = {}
+        self.match_index = {}
 
-    # =======================================================================
-    # Utilitários internos
-    # =======================================================================
+        # Timers
+        self.timer_eleicao   = None
+        self.timer_heartbeat = None
 
-    def _reset_election_timeout(self):
-        """Sorteia um novo timeout de eleição dentro da faixa configurada."""
-        self.election_timeout = random.uniform(
-            ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX
-        )
+        # Começa contando o timeout de eleição
+        self.reiniciar_timer_eleicao()
 
-    def _start_election_timer(self):
-        """
-        Cancela o timer anterior (se existir) e agenda um novo.
-        Quando disparar, o nó tentará iniciar uma eleição.
-        """
-        if self._election_timer is not None:
-            self._election_timer.cancel()
-        self._reset_election_timeout()
-        self._election_timer = threading.Timer(
-            self.election_timeout, self._start_election
-        )
-        self._election_timer.daemon = True
-        self._election_timer.start()
+        logging.info("[Nó " + str(self.node_id) + "] Iniciado como SEGUIDOR | termo=0")
 
-    def _last_log_index(self) -> int:
-        """Índice da última entrada do log (-1 se vazio)."""
-        return len(self.log) - 1
 
-    def _last_log_term(self) -> int:
-        """Termo da última entrada do log (0 se vazio)."""
-        return self.log[-1]["term"] if self.log else 0
+    # -----------------------------------------------------------------------
+    # Timer de eleição
+    # -----------------------------------------------------------------------
 
-    def _become_follower(self, term: int):
-        """
-        Transição para FOLLOWER.
-        Chamada quando descobre-se um termo maior (de qualquer mensagem recebida).
-        Reseta votos e reinicia o timer de eleição.
-        """
-        self.state        = FOLLOWER
-        self.current_term = term
-        self.voted_for    = None
-        self._start_election_timer()
-        logging.info(f"[Nó {self.node_id}] -> FOLLOWER | termo={term}")
+    def reiniciar_timer_eleicao(self):
+        # Cancela o timer anterior
+        if self.timer_eleicao is not None:
+            self.timer_eleicao.cancel()
 
-    # =======================================================================
-    # Eleição de líder
-    # =======================================================================
+        # Sorteia um timeout aleatório e agenda a eleição
+        timeout = random.uniform(TIMEOUT_ELEICAO_MIN, TIMEOUT_ELEICAO_MAX)
+        self.timer_eleicao = threading.Timer(timeout, self.iniciar_eleicao)
+        self.timer_eleicao.daemon = True
+        self.timer_eleicao.start()
 
-    def _start_election(self):
-        """
-        Disparado quando o timer de eleição expira sem receber heartbeat.
-        O nó incrementa o termo, se candidata, vota em si mesmo
-        e solicita votos a todos os outros nós em paralelo.
-        """
-        with self.lock:
-            self.state         = CANDIDATE
-            self.current_term += 1
-            self.voted_for     = self.node_id
-            votes_recebidos    = 1          # voto próprio
-            termo_da_eleicao   = self.current_term
-            ultimo_idx         = self._last_log_index()
-            ultimo_termo       = self._last_log_term()
+
+    # -----------------------------------------------------------------------
+    # Transições de estado
+    # -----------------------------------------------------------------------
+
+    def virar_seguidor(self, termo):
+        self.estado      = SEGUIDOR
+        self.termo_atual = termo
+        self.votou_em    = None
+        self.reiniciar_timer_eleicao()
+        logging.info("[Nó " + str(self.node_id) + "] -> SEGUIDOR | termo=" + str(termo))
+
+    def virar_lider(self):
+        self.estado = LIDER
+        logging.info("[Nó " + str(self.node_id) + "] *** ELEITO LIDER *** | termo=" + str(self.termo_atual))
+
+        # Líder não precisa de timer de eleição
+        if self.timer_eleicao is not None:
+            self.timer_eleicao.cancel()
+
+        # Inicializa o progresso de replicação para cada seguidor
+        for pid in URIS:
+            if pid != self.node_id:
+                self.next_index[pid]  = len(self.log)
+                self.match_index[pid] = -1
+
+        # Registra no servidor de nomes em thread separada
+        t = threading.Thread(target=self.registrar_como_lider, daemon=True)
+        t.start()
+
+        # Começa a mandar heartbeats imediatamente
+        self.enviar_heartbeats()
+
+
+    # -----------------------------------------------------------------------
+    # Eleição
+    # -----------------------------------------------------------------------
+
+    def iniciar_eleicao(self):
+        self.lock.acquire()
+        try:
+            self.estado      = CANDIDATO
+            self.termo_atual = self.termo_atual + 1
+            self.votou_em    = self.node_id
+            
+            votos         = 1
+            termo_eleicao = self.termo_atual
+            ultimo_indice = len(self.log) - 1
+
+            if len(self.log) > 0:
+                ultimo_termo = self.log[ultimo_indice]["termo"]
+            else:
+                ultimo_termo = 0
+        finally:
+            self.lock.release()
 
         logging.info(
-            f"[Nó {self.node_id}] Timeout expirou -> CANDIDATE | termo={termo_da_eleicao} "
-            f"| voto próprio computado (total=1)"
+            "[Nó " + str(self.node_id) + "] Timeout expirou -> CANDIDATO | " +
+            "termo=" + str(termo_eleicao) + " | voto proprio computado (total=1)"
         )
 
-        # Coleta votos em paralelo (um thread por peer)
-        contagem_lock = threading.Lock()
-        contagem      = [votes_recebidos]   # lista para mutabilidade em closure
+        lock_votos = threading.Lock()
+        contagem   = [votos]
 
         def pedir_voto(peer_id):
             try:
-                with Pyro5.api.Proxy(NODE_URIS[peer_id]) as peer:
-                    termo_resp, voto = peer.request_vote(
-                        termo_da_eleicao,
-                        self.node_id,
-                        ultimo_idx,
-                        ultimo_termo,
-                    )
-                with contagem_lock:
-                    if termo_resp > self.current_term:
-                        # Peer tem termo maior; abandona a candidatura
-                        with self.lock:
-                            self._become_follower(termo_resp)
+                peer = Pyro5.api.Proxy(URIS[peer_id])
+                try:
+                    resultado      = peer.rpc_pedir_voto(termo_eleicao, self.node_id, ultimo_indice, ultimo_termo)
+                    termo_resposta = resultado[0]
+                    voto_concedido = resultado[1]
+                finally:
+                    peer._pyroRelease()
+
+                lock_votos.acquire()
+                try:
+                    if termo_resposta > self.termo_atual:
+                        self.lock.acquire()
+                        try:
+                            self.virar_seguidor(termo_resposta)
+                        finally:
+                            self.lock.release()
                         return
-                    if voto:
-                        contagem[0] += 1
+
+                    if voto_concedido:
+                        contagem[0] = contagem[0] + 1
                         logging.info(
-                            f"[Nó {self.node_id}] Recebeu voto do nó {peer_id} "
-                            f"| total={contagem[0]}/{len(NODE_URIS)}"
+                            "[Nó " + str(self.node_id) + "] Recebeu voto do nó " +
+                            str(peer_id) + " | total=" + str(contagem[0]) + "/" + str(len(URIS))
                         )
                     else:
                         logging.info(
-                            f"[Nó {self.node_id}] Nó {peer_id} negou o voto"
+                            "[Nó " + str(self.node_id) + "] Nó " + str(peer_id) + " negou o voto"
                         )
-            except Exception as exc:
+                finally:
+                    lock_votos.release()
+
+            except Exception as erro:
                 logging.warning(
-                    f"[Nó {self.node_id}] Não conseguiu votar de nó {peer_id}: {exc}"
+                    "[Nó " + str(self.node_id) + "] Não conseguiu contatar nó " +
+                    str(peer_id) + ": " + str(erro)
                 )
 
-        threads = [
-            threading.Thread(target=pedir_voto, args=(pid,), daemon=True)
-            for pid in NODE_URIS if pid != self.node_id
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=2.0)   # aguarda respostas
+        threads = []
+        for pid in URIS:
+            if pid != self.node_id:
+                t = threading.Thread(target=pedir_voto, args=(pid,), daemon=True)
+                t.start()
+                threads.append(t)
 
-        with self.lock:
-            # Só assume liderança se ainda for candidato no mesmo termo
-            if self.state != CANDIDATE or self.current_term != termo_da_eleicao:
+        for t in threads:
+            t.join(timeout=2.0)
+
+        self.lock.acquire()
+        try:
+            if self.estado != CANDIDATO or self.termo_atual != termo_eleicao:
                 return
 
-            maioria = len(NODE_URIS) // 2 + 1
+            maioria = int(len(URIS) / 2) + 1
+
             if contagem[0] >= maioria:
                 logging.info(
-                    f"[Nó {self.node_id}] Maioria atingida "
-                    f"({contagem[0]}/{len(NODE_URIS)}, precisava de {maioria})"
+                    "[Nó " + str(self.node_id) + "] Maioria atingida (" +
+                    str(contagem[0]) + "/" + str(len(URIS)) + ", precisava de " + str(maioria) + ")"
                 )
-                self._become_leader()
+                self.virar_lider()
             else:
                 logging.info(
-                    f"[Nó {self.node_id}] Eleição perdida "
-                    f"({contagem[0]}/{len(NODE_URIS)} votos) | voltando a FOLLOWER"
+                    "[Nó " + str(self.node_id) + "] Eleicao perdida (" +
+                    str(contagem[0]) + "/" + str(len(URIS)) + " votos) | voltando a SEGUIDOR"
                 )
-                self._become_follower(self.current_term)
+                self.virar_seguidor(self.termo_atual)
+        finally:
+            self.lock.release()
 
-    def _become_leader(self):
-        """
-        Assume a liderança após obter maioria dos votos.
-        Inicializa os índices de progresso dos seguidores,
-        registra-se no servidor de nomes e inicia os heartbeats.
-        """
-        self.state = LEADER
-        logging.info(
-            f"[Nó {self.node_id}] *** ELEITO LÍDER *** | termo={self.current_term}"
-        )
 
-        # Cancela o timer de eleição: líder não precisa esperar heartbeat
-        if self._election_timer:
-            self._election_timer.cancel()
+    # -----------------------------------------------------------------------
+    # Registro no servidor de nomes
+    # -----------------------------------------------------------------------
 
-        # Reinicia os contadores por seguidor
-        for pid in NODE_URIS:
-            if pid != self.node_id:
-                self.next_index[pid]  = len(self.log)   # otimista: começa do fim
-                self.match_index[pid] = -1               # nada confirmado ainda
-
-        # Registra no servidor de nomes (thread separada para não bloquear)
-        threading.Thread(target=self._registrar_lider_no_ns, daemon=True).start()
-
-        # Inicia ciclo de heartbeats
-        self._enviar_heartbeats()
-
-    def _registrar_lider_no_ns(self):
-        """
-        Registra (ou sobrescreve) a entrada 'raft.leader' no servidor de nomes
-        com a URI deste nó, para que o cliente consiga encontrar o líder atual.
-        """
+    def registrar_como_lider(self):
         try:
-            ns = Pyro5.api.locate_ns()
-            uri = NODE_URIS[self.node_id]
+            ns  = Pyro5.api.locate_ns()
+            uri = URIS[self.node_id]
+
             try:
-                ns.remove(LEADER_NS_NAME)   # remove entrada anterior (2ª eleição em diante)
+                ns.remove(NOME_LIDER)
             except Exception:
                 pass
-            ns.register(LEADER_NS_NAME, uri)
+
+            ns.register(NOME_LIDER, uri)
             logging.info(
-                f"[Nó {self.node_id}] Registrado no NS como '{LEADER_NS_NAME}' -> {uri}"
+                "[Nó " + str(self.node_id) + "] Registrado no servidor de nomes " +
+                "como '" + NOME_LIDER + "' -> " + uri
             )
-        except Exception as exc:
-            logging.error(f"[Nó {self.node_id}] Erro ao registrar no NS: {exc}")
+        except Exception as erro:
+            logging.error(
+                "[Nó " + str(self.node_id) + "] Erro ao registrar no servidor de nomes: " + str(erro)
+            )
 
-    # =======================================================================
-    # Heartbeat e replicação iniciada pelo líder
-    # =======================================================================
 
-    def _enviar_heartbeats(self):
-        """
-        Envia AppendEntries para todos os seguidores periodicamente.
-        Se entries=[], funciona como heartbeat puro (mantém autoridade do líder).
-        Se há entradas novas pendentes para um seguidor, elas são incluídas.
-        Reagenda a si mesmo enquanto o nó permanecer líder.
-        """
-        if self.state != LEADER:
-            return   # para se perde a liderança
+    # -----------------------------------------------------------------------
+    # Heartbeat e replicação
+    # -----------------------------------------------------------------------
+
+    def enviar_heartbeats(self):
+        if self.estado != LIDER:
+            return
 
         def heartbeat_para(peer_id):
             try:
-                # Captura o estado atual do log para este peer (com lock)
-                with self.lock:
-                    if self.state != LEADER:
+                self.lock.acquire()
+                try:
+                    if self.estado != LIDER:
                         return
-                    ni         = self.next_index.get(peer_id, len(self.log))
-                    prev_idx   = ni - 1
-                    prev_term  = self.log[prev_idx]["term"] if prev_idx >= 0 and self.log else 0
-                    entradas   = list(self.log[ni:])    # cópia para envio
-                    termo      = self.current_term
+                    
+                    # Pega o próximo índice de log que o seguidor espera receber
+                    proximo = self.next_index[peer_id]
+
+                    indice_anterior = proximo - 1
+                    termo_anterior  = 0
+                    tamanho_log     = len(self.log)
+
+                    # Se existe uma entrada anterior a essa que vamos enviar, checa-se o seu termo
+                    if indice_anterior >= 0 and tamanho_log > 0:
+                        termo_anterior = self.log[indice_anterior]["termo"]
+
+                    entradas = []
+                    
+                    for i in range(proximo, tamanho_log):
+                        entradas.append(self.log[i])
+
+                    termo      = self.termo_atual
                     commit_idx = self.commit_index
+                finally:
+                    self.lock.release()
 
-                # Chamada PyRO fora do lock (operação de rede pode demorar)
-                with Pyro5.api.Proxy(NODE_URIS[peer_id]) as peer:
-                    termo_resp, sucesso = peer.append_entries(
-                        termo, self.node_id,
-                        prev_idx, prev_term,
-                        entradas, commit_idx,
+                peer = Pyro5.api.Proxy(URIS[peer_id])
+                try:
+                    resultado = peer.rpc_append_entries(
+                        termo,
+                        self.node_id,
+                        indice_anterior,
+                        termo_anterior,
+                        entradas,
+                        commit_idx,
                     )
+                    termo_resposta  = resultado[0]
+                    sucesso         = resultado[1]
+                    indice_seguidor = resultado[2]
+                finally:
+                    peer._pyroRelease()
 
-                # Processa resposta (com lock)
-                with self.lock:
-                    if termo_resp > self.current_term:
-                        # Seguidor conhece termo maior; perde a liderança
-                        self._become_follower(termo_resp)
+                self.lock.acquire()
+                try:
+                    if termo_resposta > self.termo_atual:
+                        self.virar_seguidor(termo_resposta)
                         return
 
                     if sucesso:
-                        # Atualiza progresso: seguidor confirmou até prev_idx + len(entradas)
-                        novo_match = prev_idx + len(entradas)
-                        self.match_index[peer_id] = novo_match
-                        self.next_index[peer_id]  = novo_match + 1
-                        self._tentar_commit()
+                        self.match_index[peer_id] = indice_seguidor
+                        self.next_index[peer_id]  = indice_seguidor + 1
+                        self.tentar_commit()
                     else:
-                        # Inconsistência de log: recua next_index e tentará novamente
-                        self.next_index[peer_id] = max(0, ni - 1)
+                        self.next_index[peer_id] = indice_seguidor + 1
+                finally:
+                    self.lock.release()
 
-            except Exception as exc:
+            except Exception as erro:
                 logging.warning(
-                    f"[Nó {self.node_id}] Falha no heartbeat para nó {peer_id}: {exc}"
+                    "[Nó " + str(self.node_id) + "] Falha no heartbeat para nó " +
+                    str(peer_id) + ": " + str(erro)
                 )
 
-        # Dispara heartbeats para todos os peers em paralelo
-        threads = [
-            threading.Thread(target=heartbeat_para, args=(pid,), daemon=True)
-            for pid in NODE_URIS if pid != self.node_id
-        ]
-        for t in threads:
-            t.start()
+        for pid in URIS:
+            if pid != self.node_id:
+                t = threading.Thread(target=heartbeat_para, args=(pid,), daemon=True)
+                t.start()
 
-        # Reagenda o próximo ciclo de heartbeats
-        self._heartbeat_timer = threading.Timer(
-            HEARTBEAT_INTERVAL, self._enviar_heartbeats
-        )
-        self._heartbeat_timer.daemon = True
-        self._heartbeat_timer.start()
+        self.timer_heartbeat = threading.Timer(INTERVALO_HEARTBEAT, self.enviar_heartbeats)
+        self.timer_heartbeat.daemon = True
+        self.timer_heartbeat.start()
 
-    def _tentar_commit(self):
-        """
-        Verifica se alguma entrada ainda não efetivada já foi replicada
-        na maioria dos nós e, se sim, avança o commit_index.
-        """
-        maioria = len(NODE_URIS) // 2 + 1
 
-        # Procura do fim do log para o primeiro candidato a commit
-        for n in range(len(self.log) - 1, self.commit_index, -1):
-            # Conta nós que têm esta entrada (líder + seguidores confirmados)
-            replicado = 1 + sum(
-                1 for mi in self.match_index.values() if mi >= n
-            )
-            if replicado >= maioria and self.log[n]["term"] == self.current_term:
-                self.commit_index = n
+    # -----------------------------------------------------------------------
+    # Commit
+    # -----------------------------------------------------------------------
+
+    def tentar_commit(self):
+        # Deve ser chamada com self.lock adquirido
+        maioria = int(len(URIS) / 2) + 1
+
+        # Percorre o log de trás para frente, só acima do commit atual
+        indice = len(self.log) - 1
+        while indice > self.commit_index:
+
+            # Conta quantos nós têm esta entrada
+            total = 1  # o próprio líder sempre tem
+            for peer_id in self.match_index:
+                if self.match_index[peer_id] >= indice:
+                    total = total + 1
+
+            # Só efetiva entradas do termo atual (seção 5.4.2 do paper)
+            entrada_do_termo_atual = False
+            if self.log[indice]["termo"] == self.termo_atual:
+                entrada_do_termo_atual = True
+
+            if total >= maioria and entrada_do_termo_atual:
+                self.commit_index = indice
+
+                comandos = []
+                for i in range(indice + 1):
+                    comandos.append(self.log[i]["comando"])
                 logging.info(
-                    f"[Nó {self.node_id}] COMMIT -> índice={n} | "
-                    f"log={[e['command'] for e in self.log[:n+1]]}"
+                    "[Nó " + str(self.node_id) + "] COMMIT -> índice=" +
+                    str(indice) + " | log=" + str(comandos)
                 )
-                break   # o próximo heartbeat propagará o novo commit_index
+                break
 
-    # =======================================================================
-    # RPCs expostos via PyRO
-    # =======================================================================
+            indice = indice - 1
 
-    def request_vote(self, term: int, candidate_id: int,
-                     last_log_index: int, last_log_term: int):
-        """
-        RPC chamado por um candidato solicitando voto.
-        """
-        with self.lock:
-            # Candidato com termo desatualizado: recusa
-            if term < self.current_term:
-                return self.current_term, False
+
+    # -----------------------------------------------------------------------
+    # RPCs
+    # -----------------------------------------------------------------------
+
+    def rpc_pedir_voto(self, termo, candidato_id, ultimo_indice, ultimo_termo):
+        self.lock.acquire()
+        try:
+            # Candidato com termo mais velho: recusa
+            if termo < self.termo_atual:
+                return (self.termo_atual, False)
 
             # Candidato com termo maior: atualiza e vira seguidor
-            if term > self.current_term:
-                self._become_follower(term)
+            if termo > self.termo_atual:
+                self.virar_seguidor(termo)
 
-            # Já vota em outro candidato neste termo?
-            if self.voted_for is not None and self.voted_for != candidate_id:
-                return self.current_term, False
+            # Já votamos em outro candidato neste termo?
+            if self.votou_em is not None and self.votou_em != candidato_id:
+                return (self.termo_atual, False)
 
-            # O log do candidato é pelo menos tão atual quanto o nosso?
-            # (critério "up-to-date" - seção 5.4.1 do paper Raft)
-            candidato_atualizado = (
-                last_log_term > self._last_log_term()
-                or (
-                    last_log_term == self._last_log_term()
-                    and last_log_index >= self._last_log_index()
-                )
-            )
-            if not candidato_atualizado:
-                return self.current_term, False
-
-            # Tudo certo: concede o voto
-            self.voted_for = candidate_id
-            self._start_election_timer()   # reseta timer ao votar
-            logging.info(
-                f"[Nó {self.node_id}] Votou no candidato {candidate_id} | termo={term}"
-            )
-            return self.current_term, True
-
-    def append_entries(self, term: int, leader_id: int,
-                       prev_log_index: int, prev_log_term: int,
-                       entries: list, leader_commit: int):
-        """
-        RPC do líder para replicar entradas de log ou enviar heartbeat.
-        Quando entries=[], trata-se de um heartbeat (sem novas entradas).
-        """
-        with self.lock:
-            # Líder com termo desatualizado: recusa
-            if term < self.current_term:
-                return self.current_term, False
-
-            # Líder legítimo (term >= current_term): reseta timer de eleição
-            if term > self.current_term or self.state == CANDIDATE:
-                self._become_follower(term)
+            # O log do candidato é tão atual quanto o nosso?
+            if len(self.log) > 0:
+                nosso_ultimo_termo = self.log[len(self.log) - 1]["termo"]
             else:
-                # Mesmo termo: apenas reinicia o timer (sem mudar voted_for)
-                self._start_election_timer()
+                nosso_ultimo_termo = 0
 
-            # Garante que está como seguidor (pode ter sido candidato)
-            self.state = FOLLOWER
+            nosso_ultimo_indice  = len(self.log) - 1
+            candidato_atualizado = False
 
-            # --- Verificação de consistência do log (seção 5.3) ---
-            if prev_log_index >= 0:
-                # Não tem a entrada em prev_log_index?
-                if prev_log_index >= len(self.log):
-                    return self.current_term, False
-                # Tem, mas com termo diferente? Conflito.
-                if self.log[prev_log_index]["term"] != prev_log_term:
-                    # Trunca o log a partir do ponto conflitante
-                    self.log = self.log[:prev_log_index]
-                    return self.current_term, False
+            if ultimo_termo > nosso_ultimo_termo:
+                candidato_atualizado = True
+            elif ultimo_termo == nosso_ultimo_termo and ultimo_indice >= nosso_ultimo_indice:
+                candidato_atualizado = True
 
-            # --- Adiciona/sobrescreve entradas novas ---
-            for i, entry in enumerate(entries):
-                # Índice absoluto desta entrada no log
-                idx = prev_log_index + 1 + i
-                if idx < len(self.log):
-                    # Entrada existe: verifica conflito de termo
-                    if self.log[idx]["term"] != entry["term"]:
-                        self.log = self.log[:idx]    # trunca a partir daqui
-                        self.log.append(entry)
+            if not candidato_atualizado:
+                return (self.termo_atual, False)
+
+            # Concede o voto
+            self.votou_em = candidato_id
+            self.reiniciar_timer_eleicao()
+            logging.info(
+                "[Nó " + str(self.node_id) + "] Votou no candidato " +
+                str(candidato_id) + " | termo=" + str(termo)
+            )
+            return (self.termo_atual, True)
+        finally:
+            self.lock.release()
+
+
+    def rpc_append_entries(self, termo, lider_id,
+                       indice_anterior, termo_anterior,
+                       entradas, lider_commit):
+        self.lock.acquire()
+        try:
+            # Líder desatualizado: rejeita e informa nosso termo atual
+            if termo < self.termo_atual:
+                return (self.termo_atual, False, len(self.log) - 1)
+
+            # Líder legítimo com termo maior: vira seguidor
+            # Se candidato, também volta a ser seguidor (líder já eleito)
+            if termo > self.termo_atual or self.estado == CANDIDATO:
+                self.virar_seguidor(termo)
+            else:
+                # Mesmo termo, só reinicia o timer pra não iniciar eleição
+                self.reiniciar_timer_eleicao()
+
+            self.estado = SEGUIDOR
+
+            if indice_anterior >= 0:
+                # O líder aponta pra uma entrada que ainda não tem: log incompleto
+                if indice_anterior >= len(self.log):
+                    return (self.termo_atual, False, len(self.log) - 1)
+
+                # Tem a entrada mas o termo não bate: log divergiu
+                # Trunca tudo a partir do ponto conflitante
+                if self.log[indice_anterior]["termo"] != termo_anterior:
+                    while len(self.log) > indice_anterior:
+                        self.log.pop()
+                    return (self.termo_atual, False, indice_anterior - 1)
+
+            # Aplica as novas entradas enviadas pelo líder
+            for i in range(len(entradas)):
+                posicao = indice_anterior + 1 + i
+
+                if posicao < len(self.log):
+                    # Já há uma entrada nessa posição: verifica se conflita
+                    if self.log[posicao]["termo"] != entradas[i]["termo"]:
+                        # Termos diferentes: trunca a partir do conflito e adiciona a do líder
+                        while len(self.log) > posicao:
+                            self.log.pop()
+                        self.log.append(entradas[i])
+                    # Se os termos são iguais, a entrada já é a correta: não faz nada
                 else:
-                    self.log.append(entry)           # nova entrada
+                    # Posição nova, além do tamanho atual: adiciona diretamente
+                    self.log.append(entradas[i])
 
-            if entries:
+            # Loga o estado do log após a atualização
+            if len(entradas) > 0:
+                comandos = []
+                for entrada in self.log:
+                    comandos.append(entrada["comando"])
+                logging.info("[Nó " + str(self.node_id) + "] Log atualizado: " + str(comandos))
+
+            # Avança o commit_index se o líder confirmou mais entradas
+            if lider_commit > self.commit_index:
+                # Não avança além do que realmente temos no log
+                if lider_commit < len(self.log) - 1:
+                    self.commit_index = lider_commit
+                else:
+                    self.commit_index = len(self.log) - 1
                 logging.info(
-                    f"[Nó {self.node_id}] Log atualizado: "
-                    f"{[e['command'] for e in self.log]}"
+                    "[Nó " + str(self.node_id) + "] COMMIT (do líder) -> índice=" +
+                    str(self.commit_index)
                 )
 
-            # --- Atualiza commit_index se o líder avançou ---
-            if leader_commit > self.commit_index:
-                self.commit_index = min(leader_commit, len(self.log) - 1)
-                logging.info(
-                    f"[Nó {self.node_id}] COMMIT (do líder) -> índice={self.commit_index}"
-                )
+            return (self.termo_atual, True, len(self.log) - 1)
+        finally:
+            self.lock.release()
 
-            return self.current_term, True
-
-    def client_request(self, command: str):
+    def rpc_comando_cliente(self, comando):
         """
-        RPC chamado pelo cliente para submeter um novo comando ao cluster.
-
-        Somente o líder pode aceitar comandos.
-        Seguidores rejeitam e informam quem (acham que) é o líder.
+        Chamado pelo cliente para enviar um comando ao cluster.
+        Só o líder aceita.
         """
         with self.lock:
-            if self.state != LEADER:
-                return False, "Este nó não é o lider."
+            if self.estado != LIDER:
+                return False, "Não sou o líder. Consulte o servidor de nomes."
 
-            # Anexa ao log; a replicação ocorrerá no próximo ciclo de heartbeat
-            entry = {"term": self.current_term, "command": command}
-            self.log.append(entry)
+            entrada = {"termo": self.termo_atual, "comando": comando}
+            self.log.append(entrada)
+
             logging.info(
-                f"[Nó {self.node_id}] Comando recebido do cliente: '{command}' "
-                f"(índice={len(self.log) - 1})"
+                "[Nó " + str(self.node_id) + "] Comando recebido: '" +
+                comando + "' (índice=" + str(len(self.log) - 1) + ")"
             )
             return True, (
-                f"Comando '{command}' adicionado ao log "
-                f"(índice={len(self.log) - 1}, termo={self.current_term})"
+                "Comando '" + comando + "' adicionado " +
+                "(índice=" + str(len(self.log) - 1) + ", termo=" + str(self.termo_atual) + ")"
             )
 
-    def get_status(self):
-        """
-        Retorna um dicionário com o estado atual do nó.
-        Útil para diagnóstico e comparação entre nós ao final da execução.
-        """
+
+    def rpc_status(self):
+        """Retorna o estado atual do nó."""
         with self.lock:
             return {
                 "node_id":      self.node_id,
-                "state":        self.state,
-                "term":         self.current_term,
-                "voted_for":    self.voted_for,
+                "estado":       self.estado,
+                "termo":        self.termo_atual,
+                "votou_em":     self.votou_em,
                 "log":          list(self.log),
                 "commit_index": self.commit_index,
             }
 
 
 # ---------------------------------------------------------------------------
-# Ponto de entrada
+# Inicialização
 # ---------------------------------------------------------------------------
 
 def main():
     if len(sys.argv) != 2 or not sys.argv[1].isdigit():
         print("Uso: python raft_node.py <node_id>")
-        print(f"     node_id deve ser um de: {list(NODE_CONFIG.keys())}")
+        print("     node_id deve ser um de: " + str(list(NOS.keys())))
         sys.exit(1)
 
     node_id = int(sys.argv[1])
-    if node_id not in NODE_CONFIG:
-        print(f"node_id inválido. Use um de: {list(NODE_CONFIG.keys())}")
+    if node_id not in NOS:
+        print("node_id inválido. Use um de: " + str(list(NOS.keys())))
         sys.exit(1)
 
     logging.basicConfig(
@@ -531,20 +561,16 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    cfg    = NODE_CONFIG[node_id]
-    porta  = cfg["port"]
+    cfg    = NOS[node_id]
+    porta  = cfg["porta"]
     obj_id = cfg["object_id"]
 
-    # Cria o Daemon PyRO na porta configurada para este nó
     daemon = Pyro5.server.Daemon(port=porta)
 
-    # Instancia o nó e registra no Daemon com o objectId pré-definido
-    # -> gera a URI: PYRO:obj_id@localhost:porta
-    node = RaftNode(node_id)
-    uri  = daemon.register(node, objectId=obj_id)
-    logging.info(f"[Nó {node_id}] URI: {uri}")
+    no  = NoRaft(node_id)
+    uri = daemon.register(no, objectId=obj_id)
+    logging.info("[Nó " + str(node_id) + "] URI: " + str(uri))
 
-    # Também registra no servidor de nomes (para localização geral)
     try:
         ns = Pyro5.api.locate_ns()
         try:
@@ -552,11 +578,11 @@ def main():
         except Exception:
             pass
         ns.register(obj_id, uri)
-        logging.info(f"[Nó {node_id}] Registrado no NS como '{obj_id}'")
-    except Exception as exc:
-        logging.warning(f"[Nó {node_id}] Servidor de nomes indisponível: {exc}")
+        logging.info("[Nó " + str(node_id) + "] Registrado no servidor de nomes como '" + obj_id + "'")
+    except Exception as erro:
+        logging.warning("[Nó " + str(node_id) + "] Servidor de nomes indisponível: " + str(erro))
 
-    logging.info(f"[Nó {node_id}] Aguardando requisições...")
+    logging.info("[Nó " + str(node_id) + "] Aguardando requisições...")
     daemon.requestLoop()
 
 
