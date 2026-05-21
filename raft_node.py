@@ -55,7 +55,6 @@ LIDER     = "LIDER"
 # Nó Raft
 # ---------------------------------------------------------------------------
 
-@Pyro5.api.expose
 class NoRaft:
 
     def __init__(self, node_id):
@@ -153,11 +152,11 @@ class NoRaft:
             votos         = 1
             termo_eleicao = self.termo_atual
             ultimo_indice = len(self.log) - 1
+            ultimo_termo  = 0
 
             if len(self.log) > 0:
                 ultimo_termo = self.log[ultimo_indice]["termo"]
-            else:
-                ultimo_termo = 0
+
         finally:
             self.lock.release()
 
@@ -191,9 +190,11 @@ class NoRaft:
 
                     if voto_concedido:
                         contagem[0] = contagem[0] + 1
+
                         logging.info(
                             "[Nó " + str(self.node_id) + "] Recebeu voto do nó " +
                             str(peer_id) + " | total=" + str(contagem[0]) + "/" + str(len(URIS))
+
                         )
                     else:
                         logging.info(
@@ -209,6 +210,7 @@ class NoRaft:
                 )
 
         threads = []
+
         for pid in URIS:
             if pid != self.node_id:
                 t = threading.Thread(target=pedir_voto, args=(pid,), daemon=True)
@@ -226,17 +228,22 @@ class NoRaft:
             maioria = int(len(URIS) / 2) + 1
 
             if contagem[0] >= maioria:
+
                 logging.info(
                     "[Nó " + str(self.node_id) + "] Maioria atingida (" +
                     str(contagem[0]) + "/" + str(len(URIS)) + ", precisava de " + str(maioria) + ")"
                 )
+
                 self.virar_lider()
             else:
+
                 logging.info(
                     "[Nó " + str(self.node_id) + "] Eleicao perdida (" +
                     str(contagem[0]) + "/" + str(len(URIS)) + " votos) | voltando a SEGUIDOR"
                 )
+
                 self.virar_seguidor(self.termo_atual)
+
         finally:
             self.lock.release()
 
@@ -256,10 +263,12 @@ class NoRaft:
                 pass
 
             ns.register(NOME_LIDER, uri)
+
             logging.info(
                 "[Nó " + str(self.node_id) + "] Registrado no servidor de nomes " +
                 "como '" + NOME_LIDER + "' -> " + uri
             )
+
         except Exception as erro:
             logging.error(
                 "[Nó " + str(self.node_id) + "] Erro ao registrar no servidor de nomes: " + str(erro)
@@ -299,6 +308,7 @@ class NoRaft:
 
                     termo      = self.termo_atual
                     commit_idx = self.commit_index
+
                 finally:
                     self.lock.release()
 
@@ -359,16 +369,19 @@ class NoRaft:
 
         # Percorre o log de trás para frente, só acima do commit atual
         indice = len(self.log) - 1
+
         while indice > self.commit_index:
 
             # Conta quantos nós têm esta entrada
             total = 1  # o próprio líder sempre tem
+
             for peer_id in self.match_index:
                 if self.match_index[peer_id] >= indice:
                     total = total + 1
 
-            # Só efetiva entradas do termo atual (seção 5.4.2 do paper)
+            # Só efetiva entradas do termo atual
             entrada_do_termo_atual = False
+            
             if self.log[indice]["termo"] == self.termo_atual:
                 entrada_do_termo_atual = True
 
@@ -391,6 +404,7 @@ class NoRaft:
     # RPCs
     # -----------------------------------------------------------------------
 
+    @Pyro5.api.expose
     def rpc_pedir_voto(self, termo, candidato_id, ultimo_indice, ultimo_termo):
         self.lock.acquire()
         try:
@@ -406,18 +420,18 @@ class NoRaft:
             if self.votou_em is not None and self.votou_em != candidato_id:
                 return (self.termo_atual, False)
 
-            # O log do candidato é tão atual quanto o nosso?
+            # O log do candidato é tão atual quanto o deste nó?
             if len(self.log) > 0:
-                nosso_ultimo_termo = self.log[len(self.log) - 1]["termo"]
+                no_ultimo_termo = self.log[len(self.log) - 1]["termo"]
             else:
-                nosso_ultimo_termo = 0
+                no_ultimo_termo = 0
 
-            nosso_ultimo_indice  = len(self.log) - 1
+            no_ultimo_indice  = len(self.log) - 1
             candidato_atualizado = False
 
-            if ultimo_termo > nosso_ultimo_termo:
+            if ultimo_termo > no_ultimo_termo:
                 candidato_atualizado = True
-            elif ultimo_termo == nosso_ultimo_termo and ultimo_indice >= nosso_ultimo_indice:
+            elif ultimo_termo == no_ultimo_termo and ultimo_indice >= no_ultimo_indice:
                 candidato_atualizado = True
 
             if not candidato_atualizado:
@@ -426,33 +440,34 @@ class NoRaft:
             # Concede o voto
             self.votou_em = candidato_id
             self.reiniciar_timer_eleicao()
+
             logging.info(
                 "[Nó " + str(self.node_id) + "] Votou no candidato " +
                 str(candidato_id) + " | termo=" + str(termo)
             )
             return (self.termo_atual, True)
+        
         finally:
             self.lock.release()
 
 
+    @Pyro5.api.expose
     def rpc_append_entries(self, termo, lider_id,
                        indice_anterior, termo_anterior,
                        entradas, lider_commit):
         self.lock.acquire()
         try:
-            # Líder desatualizado: rejeita e informa nosso termo atual
+            # Líder desatualizado
             if termo < self.termo_atual:
                 return (self.termo_atual, False, len(self.log) - 1)
 
             # Líder legítimo com termo maior: vira seguidor
-            # Se candidato, também volta a ser seguidor (líder já eleito)
             if termo > self.termo_atual or self.estado == CANDIDATO:
                 self.virar_seguidor(termo)
             else:
                 # Mesmo termo, só reinicia o timer pra não iniciar eleição
                 self.reiniciar_timer_eleicao()
-
-            self.estado = SEGUIDOR
+                self.estado = SEGUIDOR
 
             if indice_anterior >= 0:
                 # O líder aponta pra uma entrada que ainda não tem: log incompleto
@@ -496,6 +511,7 @@ class NoRaft:
                     self.commit_index = lider_commit
                 else:
                     self.commit_index = len(self.log) - 1
+
                 logging.info(
                     "[Nó " + str(self.node_id) + "] COMMIT (do líder) -> índice=" +
                     str(self.commit_index)
@@ -505,14 +521,13 @@ class NoRaft:
         finally:
             self.lock.release()
 
+    @Pyro5.api.expose
     def rpc_comando_cliente(self, comando):
-        """
-        Chamado pelo cliente para enviar um comando ao cluster.
-        Só o líder aceita.
-        """
-        with self.lock:
+        # Só o líder aceita comandos do cliente
+        self.lock.acquire()
+        try:
             if self.estado != LIDER:
-                return False, "Não sou o líder. Consulte o servidor de nomes."
+                return (False, "Este nó não é o lider.")
 
             entrada = {"termo": self.termo_atual, "comando": comando}
             self.log.append(entrada)
@@ -521,23 +536,34 @@ class NoRaft:
                 "[Nó " + str(self.node_id) + "] Comando recebido: '" +
                 comando + "' (índice=" + str(len(self.log) - 1) + ")"
             )
-            return True, (
+            return (True, (
                 "Comando '" + comando + "' adicionado " +
                 "(índice=" + str(len(self.log) - 1) + ", termo=" + str(self.termo_atual) + ")"
-            )
+            ))
+        finally:
+            self.lock.release()
 
 
+
+    @Pyro5.api.expose
     def rpc_status(self):
-        """Retorna o estado atual do nó."""
-        with self.lock:
+        # Retorna o estado atual do nó
+        self.lock.acquire()
+        try:
+            log_copia = []
+            for entrada in self.log:
+                log_copia.append(entrada)
+
             return {
                 "node_id":      self.node_id,
                 "estado":       self.estado,
                 "termo":        self.termo_atual,
                 "votou_em":     self.votou_em,
-                "log":          list(self.log),
+                "log":          log_copia,
                 "commit_index": self.commit_index,
             }
+        finally:
+            self.lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +571,7 @@ class NoRaft:
 # ---------------------------------------------------------------------------
 
 def main():
+
     if len(sys.argv) != 2 or not sys.argv[1].isdigit():
         print("Uso: python raft_node.py <node_id>")
         print("     node_id deve ser um de: " + str(list(NOS.keys())))

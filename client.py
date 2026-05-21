@@ -34,8 +34,8 @@ COMANDOS = [
     "SET x=42",
 ]
 
-ESPERA_INICIAL  = 6   # segundos para aguardar a eleição
-MAX_TENTATIVAS  = 5   # tentativas por comando
+ESPERA_INICIAL = 6  # segundos para aguardar a eleição
+MAX_TENTATIVAS = 5  # tentativas por comando
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,15 +45,16 @@ logging.basicConfig(
 
 
 def localizar_lider():
-    # Consulta o servidor de nomes pelo nome do líder
+    # Consulta o servidor de nomes pelo nome registrado pelo líder eleito
     try:
         ns  = Pyro5.api.locate_ns()
         uri = ns.lookup(NOME_LIDER)
         return str(uri)
     except Pyro5.errors.NamingError:
-        return None  # líder ainda não registrado
+        # Líder ainda não se registrou
+        return None
     except Exception as erro:
-        logging.warning(f"Erro ao contatar servidor de nomes: {erro}")
+        logging.warning("Erro ao contatar servidor de nomes: " + str(erro))
         return None
 
 
@@ -61,38 +62,48 @@ def enviar_comando(comando):
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         uri_lider = localizar_lider()
 
+        # Líder ainda não disponível — aguarda e tenta de novo
         if uri_lider is None:
             logging.warning(
-                f"Líder não encontrado. Aguardando... "
-                f"(tentativa {tentativa}/{MAX_TENTATIVAS})"
+                "Lider nao encontrado. Aguardando... " +
+                "(tentativa " + str(tentativa) + "/" + str(MAX_TENTATIVAS) + ")"
             )
             time.sleep(2)
             continue
 
-        logging.info(f"Líder em: {uri_lider}")
+        logging.info("Lider em: " + uri_lider)
 
         try:
-            with Pyro5.api.Proxy(uri_lider) as lider:
-                sucesso, mensagem = lider.rpc_comando_cliente(comando)
+            # Conecta ao líder, envia o comando e libera a conexão
+            lider = Pyro5.api.Proxy(uri_lider)
+            try:
+                resultado = lider.rpc_comando_cliente(comando)
+                sucesso   = resultado[0]
+                mensagem  = resultado[1]
+            finally:
+                lider._pyroRelease()
 
             if sucesso:
-                logging.info(f"✓ Aceito: {mensagem}")
+                logging.info("Aceito: " + str(mensagem))
                 return True
             else:
+                # Líder recusou — pode estar em transição, tenta de novo
                 logging.warning(
-                    f"✗ Recusado: {mensagem} "
-                    f"(tentativa {tentativa}/{MAX_TENTATIVAS})"
+                    "Recusado: " + str(mensagem) + " " +
+                    "(tentativa " + str(tentativa) + "/" + str(MAX_TENTATIVAS) + ")"
                 )
                 time.sleep(2)
 
         except Exception as erro:
             logging.warning(
-                f"Erro ao contatar líder: {erro} "
-                f"(tentativa {tentativa}/{MAX_TENTATIVAS})"
+                "Erro ao contatar lider: " + str(erro) + " " +
+                "(tentativa " + str(tentativa) + "/" + str(MAX_TENTATIVAS) + ")"
             )
             time.sleep(2)
 
-    logging.error(f"Desistindo do comando '{comando}' após {MAX_TENTATIVAS} tentativas.")
+    logging.error(
+        "Desistindo do comando '" + comando + "' apos " + str(MAX_TENTATIVAS) + " tentativas."
+    )
     return False
 
 
@@ -101,33 +112,46 @@ def exibir_status():
     print(" Status final do cluster")
     print("=" * 55)
 
-    for node_id, uri in URIS.items():
+    # Consulta cada nó diretamente pela URI
+    for node_id in URIS:
+        uri = URIS[node_id]
         try:
-            with Pyro5.api.Proxy(uri) as no:
+            no = Pyro5.api.Proxy(uri)
+            try:
                 status = no.rpc_status()
+            finally:
+                no._pyroRelease()
+
             print(
-                f"\n  Nó {node_id} [{status['estado']}] "
-                f"termo={status['termo']} "
-                f"commit={status['commit_index']}"
+                "\n  No " + str(node_id) +
+                " [" + status["estado"] + "]" +
+                " termo=" + str(status["termo"]) +
+                " commit=" + str(status["commit_index"])
             )
-            comandos = [e["comando"] for e in status["log"]]
-            print(f"  Log: {comandos}")
+
+            # Monta lista de comandos do log deste nó
+            comandos = []
+            for entrada in status["log"]:
+                comandos.append(entrada["comando"])
+
+            print("  Log: " + str(comandos))
+
         except Exception as erro:
-            print(f"\n  Nó {node_id}: OFFLINE ({erro})")
+            print("\n  No " + str(node_id) + ": OFFLINE (" + str(erro) + ")")
 
     print("=" * 55)
 
 
 def main():
-    print(f"\nAguardando {ESPERA_INICIAL}s para o cluster eleger um líder...\n")
+    print("\nAguardando " + str(ESPERA_INICIAL) + "s para o cluster eleger um lider...\n")
     time.sleep(ESPERA_INICIAL)
 
     for cmd in COMANDOS:
-        print(f"\n>> Enviando: {cmd}")
+        print("\n>> Enviando: " + cmd)
         enviar_comando(cmd)
         time.sleep(1.0)
 
-    print("\nAguardando propagação dos commits (3s)...")
+    print("\nAguardando propagacao dos commits (3s)...")
     time.sleep(3)
 
     exibir_status()
